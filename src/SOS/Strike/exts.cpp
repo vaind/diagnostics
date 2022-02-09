@@ -13,6 +13,11 @@
 
 #define VER_PRODUCTVERSION_W        (0x0100)
 
+#ifndef IMAGE_FILE_MACHINE_ARM64X
+#define IMAGE_FILE_MACHINE_ARM64EC 0xA641
+#define IMAGE_FILE_MACHINE_ARM64X 0xA64E
+#endif // IMAGE_FILE_MACHINE_ARM64X
+
 //
 // globals
 //
@@ -133,7 +138,9 @@ GetTargetMachine(ULONG processorType)
     }
 #endif // SOS_TARGET_ARM
 #ifdef SOS_TARGET_ARM64
-    if (processorType == IMAGE_FILE_MACHINE_ARM64)
+    if (processorType == IMAGE_FILE_MACHINE_ARM64
+        || processorType == IMAGE_FILE_MACHINE_ARM64X
+        || processorType == IMAGE_FILE_MACHINE_ARM64EC)
     {
         targetMachine = ARM64Machine::GetInstance();
     }
