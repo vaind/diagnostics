@@ -13,11 +13,6 @@
 
 #define VER_PRODUCTVERSION_W        (0x0100)
 
-#ifndef IMAGE_FILE_MACHINE_ARM64X
-#define IMAGE_FILE_MACHINE_ARM64EC 0xA641
-#define IMAGE_FILE_MACHINE_ARM64X 0xA64E
-#endif // IMAGE_FILE_MACHINE_ARM64X
-
 //
 // globals
 //
@@ -172,6 +167,8 @@ ArchQuery(void)
                 architecture = "arm32";
                 break;
             case IMAGE_FILE_MACHINE_ARM64:
+            case IMAGE_FILE_MACHINE_ARM64EC:
+            case IMAGE_FILE_MACHINE_ARM64X:
                 architecture = "arm64";
                 break;
         }
