@@ -3,6 +3,11 @@
 // See the LICENSE file in the project root for more information.
 
 #nullable enable
+#pragma warning disable CS8600
+#pragma warning disable CS8602
+#pragma warning disable CS8603
+#pragma warning disable CS8604
+
 using Microsoft.Diagnostics.DebugServices;
 using Microsoft.Diagnostics.Runtime;
 using System;
