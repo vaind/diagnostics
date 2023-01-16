@@ -3,12 +3,10 @@
     "dotnet": "8.0.100-alpha.1.23061.8",
     "runtimes": {
       "dotnet/x64": [
-        "$(MicrosoftNETCoreApp31Version)",
         "$(MicrosoftNETCoreApp60Version)",
         "$(VSRedistCommonNetCoreSharedFrameworkx6470Version)"
       ],
       "dotnet/x86": [
-        "$(MicrosoftNETCoreApp31Version)",
         "$(MicrosoftNETCoreApp60Version)",
         "$(VSRedistCommonNetCoreSharedFrameworkx6470Version)"
       ],
