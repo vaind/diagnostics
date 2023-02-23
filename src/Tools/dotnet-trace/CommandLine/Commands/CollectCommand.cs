@@ -3,6 +3,7 @@
 // See the LICENSE file in the project root for more information.
 
 using Microsoft.Diagnostics.NETCore.Client;
+using Microsoft.Diagnostics.Tracing;
 using Microsoft.Internal.Common.Utils;
 using Microsoft.Tools.Common;
 using System;
@@ -16,6 +17,7 @@ using System.Linq;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Diagnostics.Tracing.EventPipe;
 
 namespace Microsoft.Diagnostics.Tools.Trace
 {
@@ -31,6 +33,31 @@ namespace Microsoft.Diagnostics.Tools.Trace
             }
         }
         delegate Task<int> CollectDelegate(CancellationToken ct, IConsole console, int processId, FileInfo output, uint buffersize, string providers, string profile, TraceFileFormat format, TimeSpan duration, string clrevents, string clreventlevel, string name, string port, bool showchildio, bool resumeRuntime);
+        public static long FindPrimeNumber(int n)
+        {
+            int count = 0;
+            long a = 2;
+            while (count < n)
+            {
+                long b = 2;
+                int prime = 1;// to check if found a prime
+                while (b * b <= a)
+                {
+                    if (a % b == 0)
+                    {
+                        prime = 0;
+                        break;
+                    }
+                    b++;
+                }
+                if (prime > 0)
+                {
+                    count++;
+                }
+                a++;
+            }
+            return (--a);
+        }
 
         /// <summary>
         /// Collects a diagnostic trace from a currently running process or launch a child process and trace it.
@@ -85,26 +112,10 @@ namespace Microsoft.Diagnostics.Tools.Trace
                     ct = CancellationToken.None;
                 }
 
-                if (!ProcessLauncher.Launcher.HasChildProc)
-                {
-                    if (showchildio)
-                    {
-                        Console.WriteLine("--show-child-io must not be specified when attaching to a process");
-                        return ReturnCode.ArgumentError;
-                    }
-                    if (CommandUtils.ValidateArgumentsForAttach(processId, name, diagnosticPort, out int resolvedProcessId))
-                    {
-                        processId = resolvedProcessId;
-                    }
-                    else
-                    {
-                        return ReturnCode.ArgumentError;
-                    }
-                }
-                else if (!CommandUtils.ValidateArgumentsForChildProcess(processId, name, diagnosticPort))
-                {
-                    return ReturnCode.ArgumentError;
-                }
+
+
+
+                processId = Process.GetCurrentProcess().Id;
 
                 if (profile.Length == 0 && providers.Length == 0 && clrevents.Length == 0)
                 {
@@ -157,6 +168,9 @@ namespace Microsoft.Diagnostics.Tools.Trace
                 }
 
                 PrintProviders(providerCollection, enabledBy);
+
+
+                var sw = Stopwatch.StartNew();
 
                 DiagnosticsClient diagnosticsClient;
                 Process process = null;
@@ -268,6 +282,29 @@ namespace Microsoft.Diagnostics.Tools.Trace
 
                         LineRewriter rewriter = null;
 
+                        // Running the profile data collection on a custom thread so we can skip 
+                        var profilerThread = new Thread(new ThreadStart(() => {
+                            var source = new EventPipeEventSource(session.EventStream);
+
+                            var profiler = new SentrySampleProfiler(source);
+
+                            //source.Dynamic.All += (TraceEvent obj) => {
+                            //    //Console.WriteLine(obj.EventName);
+                            //};
+                            try {
+                                source.Process();
+                                Console.WriteLine("Profiling finished");
+                            }
+                            // NOTE: This exception does not currently exist. It is something that needs to be added to TraceEvent.
+                            catch (Exception e) {
+                                Console.WriteLine("Error encountered while processing events");
+                                Console.WriteLine(e.ToString());
+                            }
+                        })) {
+                            Name = "sentry-profiler"
+                        };
+                        profilerThread.Start();
+
                         using (var fs = new FileStream(output.FullName, FileMode.Create, FileAccess.Write))
                         {
                             ConsoleWriteLine($"Process        : {processMainModuleFileName}");
@@ -276,9 +313,9 @@ namespace Microsoft.Diagnostics.Tools.Trace
                                 ConsoleWriteLine($"Trace Duration : {duration.ToString(@"dd\:hh\:mm\:ss")}");
                             ConsoleWriteLine("\n\n");
 
-                            var fileInfo = new FileInfo(output.FullName);
-                            Task copyTask = session.EventStream.CopyToAsync(fs);
-                            Task shouldExitTask = copyTask.ContinueWith((task) => shouldExit.Set());
+                                var fileInfo = new FileInfo(output.FullName);
+                            //Task copyTask = session.EventStream.CopyToAsync(fs);
+                            //Task shouldExitTask = copyTask.ContinueWith((task) => shouldExit.Set());
 
                             if (printStatusOverTime)
                             {
@@ -298,42 +335,42 @@ namespace Microsoft.Diagnostics.Tools.Trace
 
                                 if (rundownRequested)
                                     ConsoleWriteLine("Stopping the trace. This may take several minutes depending on the application being traced.");
+
+                                FindPrimeNumber(100000);
                             };
 
                             while (!shouldExit.WaitOne(100) && !(cancelOnEnter && Console.KeyAvailable && Console.ReadKey(true).Key == ConsoleKey.Enter))
                                 printStatus();
 
-                            // if the CopyToAsync ended early (target program exited, etc.), then we don't need to stop the session.
-                            if (!copyTask.Wait(0))
-                            {
-                                // Behavior concerning Enter moving text in the terminal buffer when at the bottom of the buffer
-                                // is different between Console/Terminals on Windows and Mac/Linux
-                                if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows) &&
-                                    printStatusOverTime &&
-                                    rewriter != null &&
-                                    Math.Abs(Console.CursorTop - Console.BufferHeight) == 1)
-                                {
-                                    rewriter.LineToClear--;
-                                }
-                                collectionStopped = true;
-                                durationTimer?.Stop();
-                                rundownRequested = true;
-                                session.Stop();
+                            session.Stop();
 
-                                do
-                                {
-                                    printStatus();
-                                } while (!copyTask.Wait(100));
-                            }
-                            // At this point the copyTask will have finished, so wait on the shouldExitTask in case it threw
-                            // an exception or had some other interesting behavior
-                            shouldExitTask.Wait();
+                            // if the CopyToAsync ended early (target program exited, etc.), then we don't need to stop the session.
+                            //if (!copyTask.Wait(0)) {
+                            //    // Behavior concerning Enter moving text in the terminal buffer when at the bottom of the buffer
+                            //    // is different between Console/Terminals on Windows and Mac/Linux
+                            //    if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows) &&
+                            //        printStatusOverTime &&
+                            //        rewriter != null &&
+                            //        Math.Abs(Console.CursorTop - Console.BufferHeight) == 1) {
+                            //        rewriter.LineToClear--;
+                            //    }
+                            //    collectionStopped = true;
+                            //    durationTimer?.Stop();
+                            //    rundownRequested = true;
+                            //    session.Stop();
+
+                            //    do {
+                            //        printStatus();
+                            //    } while (!copyTask.Wait(100));
+                            //}
+                            //// At this point the copyTask will have finished, so wait on the shouldExitTask in case it threw
+                            //// an exception or had some other interesting behavior
+                            //shouldExitTask.Wait();
                         }
 
                         ConsoleWriteLine($"\nTrace completed.");
 
-                        if (format != TraceFileFormat.NetTrace)
-                            TraceFileFormatConverter.ConvertToFormat(format, output.FullName);
+                        //ConvertToSentry(output.FullName);
                     }
 
                     if (!collectionStopped && !ct.IsCancellationRequested)
@@ -381,6 +418,41 @@ namespace Microsoft.Diagnostics.Tools.Trace
             }
             return await Task.FromResult(ret);
         }
+
+        //private static void ConvertToSentry(string fileToConvert, string outputFilename = "") {
+        //    if (string.IsNullOrWhiteSpace(outputFilename))
+        //        outputFilename = fileToConvert;
+
+        //    outputFilename = Path.ChangeExtension(outputFilename, ".json");
+        //    Console.Out.WriteLine($"Writing:\t{outputFilename}");
+
+        //    // We convert the EventPipe log (ETL) to ETLX to get processed stack traces. 
+        //    // See https://github.com/microsoft/perfview/blob/main/documentation/TraceEvent/TraceEventProgrammersGuide.md#using-call-stacks-with-the-traceevent-library
+        //    // NOTE: we may be able to skip collecting to the original ETL (nettrace) and just create ETLX directly, see CreateFromEventPipeDataFile() code.
+        //    // ContinueOnError - best-effort if there's a broken trace. The resulting file may contain broken stacks as a result.
+        //    var etlxFilePath = TraceLog.CreateFromEventPipeDataFile(fileToConvert, null, new TraceLogOptions() { ContinueOnError = true });
+
+        //    using (var symbolReader = new SymbolReader(TextWriter.Null) /*{ SymbolPath = SymbolPath.MicrosoftSymbolServerPath }*/)
+        //    using (var eventLog = new TraceLog(etlxFilePath)) {
+        //        var stackSource = new MutableTraceEventStackSource(eventLog) {
+        //            OnlyManagedCodeStacks = true // EventPipe currently only has managed code stacks.
+        //        };
+
+        //        var computer = new SampleProfilerThreadTimeComputer(eventLog, symbolReader) {
+        //            IncludeEventSourceEvents = false // SpeedScope handles only CPU samples, events are not supported
+        //            // TODO, at the very least, can we filter these out before writing to the original nettrace file?
+        //        };
+        //        computer.GenerateThreadTimeStacks(stackSource);
+
+        //        SentryProfileStackSourceWriter.WriteStackViewAsJson(stackSource, outputFilename);
+        //    }
+
+        //    if (File.Exists(etlxFilePath)) {
+        //        File.Delete(etlxFilePath);
+        //    }
+
+        //    Console.Out.WriteLine("Conversion complete");
+        //}
 
         private static void PrintProviders(IReadOnlyList<EventPipeProvider> providers, Dictionary<string, string> enabledBy)
         {
