@@ -434,7 +434,6 @@ namespace Microsoft.Diagnostics.Tools.Trace
             // ContinueOnError - best-effort if there's a broken trace. The resulting file may contain broken stacks as a result.
             var etlxFilePath = TraceLog.CreateFromEventPipeDataFile(fileToConvert, null, new TraceLogOptions() { ContinueOnError = true });
 
-            using (var symbolReader = new SymbolReader(TextWriter.Null) /*{ SymbolPath = SymbolPath.MicrosoftSymbolServerPath }*/)
             using (var eventLog = new TraceLog(etlxFilePath)) {
                 var processor = new SentrySampleProfiler(eventLog);
                 processor.Process();
