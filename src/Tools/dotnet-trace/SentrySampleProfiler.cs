@@ -74,24 +74,24 @@ namespace Microsoft.Diagnostics.Tools.Trace {
 
         //private ThreadState[] _threadState;            // This maps thread (indexes) to what we know about the thread
 
-        private StackSourceSample _sample;                 // Reusable scratch space
-        private MutableTraceEventStackSource _outputStackSource; // The output source we are generating. 
+        //private StackSourceSample _sample;                 // Reusable scratch space
+        //private MutableTraceEventStackSource _outputStackSource; // The output source we are generating. 
 
-        // These are boring caches of frame names which speed things up a bit.  
-        private StackSourceFrameIndex _ExternalFrameIndex;
-        private StackSourceFrameIndex _cpuFrameIndex;
+        //// These are boring caches of frame names which speed things up a bit.  
+        //private StackSourceFrameIndex _ExternalFrameIndex;
+        //private StackSourceFrameIndex _cpuFrameIndex;
         //private Tracing.ActivityComputer _activityComputer;                        // Used to compute stacks for Tasks 
 
         public SentrySampleProfiler(TraceLog traceLog) {
             _eventLog = traceLog;
             _eventSource = _eventLog.Events.GetSource();
 
-            _outputStackSource = new MutableTraceEventStackSource(_eventLog) {
-                OnlyManagedCodeStacks = true // EventPipe currently only has managed code stacks.
-            };
-            _sample = new StackSourceSample(_outputStackSource);
-            _ExternalFrameIndex = _outputStackSource.Interner.FrameIntern("UNMANAGED_CODE_TIME");
-            _cpuFrameIndex = _outputStackSource.Interner.FrameIntern("CPU_TIME");
+            //_outputStackSource = new MutableTraceEventStackSource(_eventLog) {
+            //    OnlyManagedCodeStacks = true // EventPipe currently only has managed code stacks.
+            //};
+            //_sample = new StackSourceSample(_outputStackSource);
+            //_ExternalFrameIndex = _outputStackSource.Interner.FrameIntern("UNMANAGED_CODE_TIME");
+            //_cpuFrameIndex = _outputStackSource.Interner.FrameIntern("CPU_TIME");
 
             //if (GroupByStartStopActivity) {
             //    UseTasks = true;
