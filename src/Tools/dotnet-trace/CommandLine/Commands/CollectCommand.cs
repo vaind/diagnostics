@@ -442,7 +442,7 @@ namespace Microsoft.Diagnostics.Tools.Trace
                 //    OnlyManagedCodeStacks = true // EventPipe currently only has managed code stacks.
                 //};
 
-                //var computer = new SampleProfilerThreadTimeComputer(eventLog, symbolReader) {
+                //var computer = new SampleProfilerThreadTimeComputer(eventLog, new SymbolReader(TextWriter.Null)) {
                 //    IncludeEventSourceEvents = false // SpeedScope handles only CPU samples, events are not supported
                 //    // TODO, at the very least, can we filter these out before writing to the original nettrace file?
                 //};

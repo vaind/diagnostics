@@ -4,7 +4,9 @@ using Microsoft.Diagnostics.Tracing.EventPipe;
 using Microsoft.Diagnostics.Tracing.Parsers;
 using Microsoft.Diagnostics.Tracing.Session;
 using Microsoft.Diagnostics.Tracing.Stacks;
+using Sentry;
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Diagnostics.Tracing;
@@ -14,20 +16,25 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading.Tasks;
 
-namespace Microsoft.Diagnostics.Tools.Trace {
+namespace Microsoft.Diagnostics.Tools.Trace
+{
+    /// A list of frame indexes.
+    using SentryProfileStackTrace = HashableGrowableArray<int>;
+
     /// <summary>
     /// Processes TraceLog to compose a SentrySampleProfile.
-    ///  
-    /// Based on https://github.com/microsoft/perfview/blob/d4c209ad68012de03ff4c595714b2b7714da036f/src/TraceEvent/Computers/SampleProfilerThreadTimeComputer.cs
+    ///
+    /// Based on https://github.com/microsoft/perfview/blob/d4c209ad680`2de03ff4c595714b2b7714da036f/src/TraceEvent/Computers/SampleProfilerThreadTimeComputer.cs
     /// </summary>
-    internal class SentrySampleProfiler {
-        ///// <summary>
-        ///// If set we compute thread time using Tasks
-        ///// </summary>
-        //private bool UseTasks = true;
+    internal class SentrySampleProfiler
+    {
+        /// <summary>
+        /// If set we compute thread time using Tasks
+        /// </summary>
+        private bool UseTasks = true;
 
         ///// <summary>
-        ///// Use start-stop activities as the grouping construct. 
+        ///// Use start-stop activities as the grouping construct.
         ///// </summary>
         //private bool GroupByStartStopActivity = true;
 
@@ -38,106 +45,121 @@ namespace Microsoft.Diagnostics.Tools.Trace {
         private bool IgnoreApplicationInsightsRequestsWithRelatedActivityId { get; set; } = true;
 
 
-        private readonly TraceLog _eventLog;                        // The event log associated with _source.  
+        private readonly TraceLog _eventLog;                        // The event log associated with _source.
         TraceLogEventSource _eventSource;
+
+        /// <summary>
+        /// Output profile being built.
+        /// </summary>
         private readonly SentrySampleProfile _profile = new();
 
+        // A sparse array that maps from StackSourceFrameIndex to the frame index in the output Profile.
+        private GrowableArray<int> _frameIndexes = new(10000);
 
-        //private Tracing.StartStopActivityComputer _startStopActivities;    // Tracks start-stop activities so we can add them to the top above thread in the stack.  
+        // A dictionary a StackTrace sealed array into the output Profile.
+        private Dictionary<SentryProfileStackTrace, int> _stackIndexes = new(100);
 
-        // UNKNOWN_ASYNC support 
+        //private Tracing.StartStopActivityComputer _startStopActivities;    // Tracks start-stop activities so we can add them to the top above thread in the stack.
+
+        // UNKNOWN_ASYNC support
         ///// <summary>
         ///// Used to create UNKNOWN frames for start-stop activities.   This is indexed by Tracing.StartStopActivityIndex.
         ///// and for each start-stop activity indicates when unknown time starts.   However if that activity still
-        ///// has known activities associated with it then the number will be negative, and its value is the 
-        ///// ref-count of known activities (thus when it falls to 0, it we set it to the start of unknown time. 
-        ///// This is indexed by the TOP-MOST start-stop activity.  
+        ///// has known activities associated with it then the number will be negative, and its value is the
+        ///// ref-count of known activities (thus when it falls to 0, it we set it to the start of unknown time.
+        ///// This is indexed by the TOP-MOST start-stop activity.
         ///// </summary>
         //private GrowableArray<double> _unknownTimeStartMsec;
 
         ///// <summary>
-        ///// maps thread ID to the current TOP-MOST start-stop activity running on that thread.   Used to updated _unknownTimeStartMsec 
-        ///// to figure out when to put in UNKNOWN_ASYNC nodes.  
+        ///// maps thread ID to the current TOP-MOST start-stop activity running on that thread.   Used to updated _unknownTimeStartMsec
+        ///// to figure out when to put in UNKNOWN_ASYNC nodes.
         ///// </summary>
         //private Tracing.StartStopActivity[] _threadToStartStopActivity;
 
         ///// <summary>
-        ///// Sadly, with AWAIT nodes might come into existence AFTER we would have normally identified 
+        ///// Sadly, with AWAIT nodes might come into existence AFTER we would have normally identified
         ///// a region as having no thread/await working on it.  Thus you have to be able to 'undo' ASYNC_UNKONWN
         ///// nodes.   We solve this by remembering all of our ASYNC_UNKNOWN nodes on a list (basically provisional)
-        ///// and only add them when the start-stop activity dies (when we know there can't be another AWAIT.  
-        ///// Note that we only care about TOP-MOST activities.  
+        ///// and only add them when the start-stop activity dies (when we know there can't be another AWAIT.
+        ///// Note that we only care about TOP-MOST activities.
         ///// </summary>
         //private GrowableArray<List<StackSourceSample>> _startStopActivityToAsyncUnknownSamples;
 
-        // End UNKNOWN_ASYNC support 
+        // End UNKNOWN_ASYNC support
 
         //private ThreadState[] _threadState;            // This maps thread (indexes) to what we know about the thread
 
         //private StackSourceSample _sample;                 // Reusable scratch space
-        //private MutableTraceEventStackSource _outputStackSource; // The output source we are generating. 
+        private MutableTraceEventStackSource _stackSource; // The output source we are generating.
+        // private TraceEventStackSource _stackSource;
 
-        //// These are boring caches of frame names which speed things up a bit.  
+        //// These are boring caches of frame names which speed things up a bit.
         //private StackSourceFrameIndex _ExternalFrameIndex;
         //private StackSourceFrameIndex _cpuFrameIndex;
-        //private Tracing.ActivityComputer _activityComputer;                        // Used to compute stacks for Tasks 
+        private Tracing.ActivityComputer _activityComputer;                        // Used to compute stacks for Tasks
 
-        public SentrySampleProfiler(TraceLog traceLog) {
+        public SentrySampleProfiler(TraceLog traceLog)
+        {
             _eventLog = traceLog;
             _eventSource = _eventLog.Events.GetSource();
 
-            //_outputStackSource = new MutableTraceEventStackSource(_eventLog) {
-            //    OnlyManagedCodeStacks = true // EventPipe currently only has managed code stacks.
-            //};
-            //_sample = new StackSourceSample(_outputStackSource);
-            //_ExternalFrameIndex = _outputStackSource.Interner.FrameIntern("UNMANAGED_CODE_TIME");
-            //_cpuFrameIndex = _outputStackSource.Interner.FrameIntern("CPU_TIME");
+            _stackSource = new MutableTraceEventStackSource(_eventLog)
+            {
+                //_stackSource = new TraceEventStackSource(_eventLog.Events) {
+                OnlyManagedCodeStacks = true // EventPipe currently only has managed code stacks.
+            };
+            //_sample = new StackSourceSample(_stackSource);
+            //_ExternalFrameIndex = _stackSource.Interner.FrameIntern("UNMANAGED_CODE_TIME");
+            //_cpuFrameIndex = _stackSource.Interner.FrameIntern("CPU_TIME");
 
             //if (GroupByStartStopActivity) {
             //    UseTasks = true;
             //}
 
-            //if (UseTasks) {
-            //    _activityComputer = new Tracing.ActivityComputer(_eventSource, new SymbolReader(TextWriter.Null));
-            //    _activityComputer.AwaitUnblocks += delegate (TraceActivity activity, Tracing.TraceEvent data) {
-            //        var sample = _sample;
-            //        sample.Metric = (float)(activity.StartTimeRelativeMSec - activity.CreationTimeRelativeMSec);
-            //        sample.TimeRelativeMSec = activity.CreationTimeRelativeMSec;
+            if (UseTasks)
+            {
+                _activityComputer = new Tracing.ActivityComputer(_eventSource, new SymbolReader(TextWriter.Null));
+                _activityComputer.AwaitUnblocks += delegate (TraceActivity activity, Tracing.TraceEvent data)
+                {
+                    //var sample = _sample;
+                    //sample.Metric = (float)(activity.StartTimeRelativeMSec - activity.CreationTimeRelativeMSec);
+                    //sample.TimeRelativeMSec = activity.CreationTimeRelativeMSec;
 
-            //        // The stack at the Unblock, is the stack at the time the task was created (when blocking started).  
-            //        sample.StackIndex = _activityComputer.GetCallStackForActivity(_outputStackSource, activity, GetTopFramesForActivityComputerCase(data, data.Thread(), true));
+                    //// The stack at the Unblock, is the stack at the time the task was created (when blocking started).
+                    //sample.StackIndex = _activityComputer.GetCallStackForActivity(_stackSource, activity, GetTopFramesForActivityComputerCase(data, data.Thread(), true));
 
-            //        StackSourceFrameIndex awaitFrame = _outputStackSource.Interner.FrameIntern("AWAIT_TIME");
-            //        sample.StackIndex = _outputStackSource.Interner.CallStackIntern(awaitFrame, sample.StackIndex);
+                    //StackSourceFrameIndex awaitFrame = _stackSource.Interner.FrameIntern("AWAIT_TIME");
+                    //sample.StackIndex = _stackSource.Interner.CallStackIntern(awaitFrame, sample.StackIndex);
 
-            //        _outputStackSource.AddSample(sample);
+                    //_stackSource.AddSample(sample);
 
-            //        if (_threadToStartStopActivity != null) {
-            //            UpdateStartStopActivityOnAwaitComplete(activity, data);
-            //        }
-            //    };
+                    //if (_threadToStartStopActivity != null) {
+                    //    UpdateStartStopActivityOnAwaitComplete(activity, data);
+                    //}
+                };
 
-            //    // We can provide a bit of extra value (and it is useful for debugging) if we immediately log a CPU 
-            //    // sample when we schedule or start a task.  That we we get the very instant it starts.  
-            //    var tplProvider = new TplEtwProviderTraceEventParser(_eventSource);
-            //    tplProvider.AwaitTaskContinuationScheduledSend += OnSampledProfile;
-            //    tplProvider.TaskScheduledSend += OnSampledProfile;
-            //    tplProvider.TaskExecuteStart += OnSampledProfile;
-            //    tplProvider.TaskWaitSend += OnSampledProfile;
-            //    tplProvider.TaskWaitStop += OnTaskUnblock;  // Log the activity stack even if you don't have a stack. 
-            //}
+                // We can provide a bit of extra value (and it is useful for debugging) if we immediately log a CPU
+                // sample when we schedule or start a task.  That we we get the very instant it starts.
+                var tplProvider = new TplEtwProviderTraceEventParser(_eventSource);
+                tplProvider.AwaitTaskContinuationScheduledSend += OnSampledProfile;
+                tplProvider.TaskScheduledSend += OnSampledProfile;
+                tplProvider.TaskExecuteStart += OnSampledProfile;
+                tplProvider.TaskWaitSend += OnSampledProfile;
+                tplProvider.TaskWaitStop += OnTaskUnblock;  // Log the activity stack even if you don't have a stack.
+            }
 
             //if (GroupByStartStopActivity) {
             //    _startStopActivities = new Tracing.StartStopActivityComputer(_eventSource, _activityComputer, IgnoreApplicationInsightsRequestsWithRelatedActivityId);
 
-            //    // Maps thread Indexes to the start-stop activity that they are executing.  
+            //    // Maps thread Indexes to the start-stop activity that they are executing.
             //    _threadToStartStopActivity = new Tracing.StartStopActivity[_eventLog.Threads.Count];
 
             //    /*********  Start Unknown Async State machine for StartStop activities ******/
             //    // The delegates below along with the AddUnkownAsyncDurationIfNeeded have one purpose:
             //    // To inject UNKNOWN_ASYNC stacks when there is an active start-stop activity that is
             //    // 'missing' time.   It has the effect of ensuring that Start-Stop tasks always have
-            //    // a metric that is not unrealistically small.  
+            //    // a metric that is not unrealistically small.
             //    _activityComputer.Start += delegate (TraceActivity activity, Tracing.TraceEvent data) {
             //        Tracing.StartStopActivity newStartStopActivityForThread = _startStopActivities.GetCurrentStartStopActivity(activity.Thread, data);
             //        UpdateThreadToWorkOnStartStopActivity(activity.Thread, newStartStopActivityForThread, data);
@@ -150,7 +172,7 @@ namespace Microsoft.Diagnostics.Tools.Trace {
 
             //    _startStopActivities.Start += delegate (Tracing.StartStopActivity startStopActivity, Tracing.TraceEvent data) {
             //        // We only care about the top-most activities since unknown async time is defined as time
-            //        // where a top  most activity is running but no thread (or await time) is associated with it 
+            //        // where a top  most activity is running but no thread (or await time) is associated with it
             //        // fast out otherwise (we just ensure that we mark the thread as doing this activity)
             //        if (startStopActivity.Creator != null) {
             //            UpdateThreadToWorkOnStartStopActivity(data.Thread(), startStopActivity, data);
@@ -158,16 +180,16 @@ namespace Microsoft.Diagnostics.Tools.Trace {
             //        }
 
             //        // Then we have a refcount of exactly one
-            //        Debug.Assert(_unknownTimeStartMsec.Get((int)startStopActivity.Index) >= 0);    // There was nothing running before.  
+            //        Debug.Assert(_unknownTimeStartMsec.Get((int)startStopActivity.Index) >= 0);    // There was nothing running before.
 
-            //        _unknownTimeStartMsec.Set((int)startStopActivity.Index, -1);       // Set it so just we are running.  
+            //        _unknownTimeStartMsec.Set((int)startStopActivity.Index, -1);       // Set it so just we are running.
             //        _threadToStartStopActivity[(int)data.Thread().ThreadIndex] = startStopActivity;
             //    };
 
             //    _startStopActivities.Stop += delegate (Tracing.StartStopActivity startStopActivity, Tracing.TraceEvent data) {
             //        // We only care about the top-most activities since unknown async time is defined as time
-            //        // where a top  most activity is running but no thread (or await time) is associated with it 
-            //        // fast out otherwise   
+            //        // where a top  most activity is running but no thread (or await time) is associated with it
+            //        // fast out otherwise
             //        if (startStopActivity.Creator != null) {
             //            return;
             //        }
@@ -177,11 +199,11 @@ namespace Microsoft.Diagnostics.Tools.Trace {
             //            AddUnkownAsyncDurationIfNeeded(startStopActivity, unknownStartTime, data);
             //        }
 
-            //        // Actually emit all the async unknown events.  
+            //        // Actually emit all the async unknown events.
             //        List<StackSourceSample> samples = _startStopActivityToAsyncUnknownSamples.Get((int)startStopActivity.Index);
             //        if (samples != null) {
             //            foreach (var sample in samples) {
-            //                _outputStackSource.AddSample(sample);  // Adding Unknown ASync
+            //                _stackSource.AddSample(sample);  // Adding Unknown ASync
             //            }
 
             //            _startStopActivityToAsyncUnknownSamples.Set((int)startStopActivity.Index, null);
@@ -203,7 +225,8 @@ namespace Microsoft.Diagnostics.Tools.Trace {
             _eventSource.Process();
         }
 
-        public void Process() {
+        public void Process()
+        {
             //_eventSource.Process();
         }
 
@@ -219,7 +242,7 @@ namespace Microsoft.Diagnostics.Tools.Trace {
         //        startStopActivity = startStopActivity.Creator;
         //    }
 
-        //    // If the await finishes before the ASYNC_UNKNOWN, simply adust the time.  
+        //    // If the await finishes before the ASYNC_UNKNOWN, simply adust the time.
         //    if (0 <= _unknownTimeStartMsec.Get((int)startStopActivity.Index)) {
         //        _unknownTimeStartMsec.Set((int)startStopActivity.Index, data.TimeStampRelativeMSec);
         //    }
@@ -247,8 +270,8 @@ namespace Microsoft.Diagnostics.Tools.Trace {
         //}
 
         ///// <summary>
-        ///// Updates it so that 'thread' is now working on newStartStop, which can be null which means that it is not working on any 
-        ///// start-stop task. 
+        ///// Updates it so that 'thread' is now working on newStartStop, which can be null which means that it is not working on any
+        ///// start-stop task.
         ///// </summary>
         //private void UpdateThreadToWorkOnStartStopActivity(TraceThread thread, Tracing.StartStopActivity newStartStop, Tracing.TraceEvent data) {
         //    // Make the new-start stop activity be the top most one.   This is all we need and is more robust in the case
@@ -262,19 +285,19 @@ namespace Microsoft.Diagnostics.Tools.Trace {
 
         //    Tracing.StartStopActivity oldStartStop = _threadToStartStopActivity[(int)thread.ThreadIndex];
         //    Debug.Assert(oldStartStop == null || oldStartStop.Creator == null);
-        //    if (oldStartStop == newStartStop)       // No change, nothing to do, quick exit.  
+        //    if (oldStartStop == newStartStop)       // No change, nothing to do, quick exit.
         //    {
         //        return;
         //    }
 
-        //    // Decrement the start-stop which lost its thread. 
+        //    // Decrement the start-stop which lost its thread.
         //    if (oldStartStop != null) {
         //        double unknownStartTimeMSec = _unknownTimeStartMsec.Get((int)oldStartStop.Index);
         //        Debug.Assert(unknownStartTimeMSec < 0);
         //        if (unknownStartTimeMSec < 0) {
         //            unknownStartTimeMSec++;     //We represent the ref count as a negative number, here we are decrementing the ref count
         //            if (unknownStartTimeMSec == 0) {
-        //                unknownStartTimeMSec = data.TimeStampRelativeMSec;      // Remember when we dropped to zero.  
+        //                unknownStartTimeMSec = data.TimeStampRelativeMSec;      // Remember when we dropped to zero.
         //            }
 
         //            _unknownTimeStartMsec.Set((int)oldStartStop.Index, unknownStartTimeMSec);
@@ -282,10 +305,10 @@ namespace Microsoft.Diagnostics.Tools.Trace {
         //    }
         //    _threadToStartStopActivity[(int)thread.ThreadIndex] = newStartStop;
 
-        //    // Increment refcount on the new startStop activity 
+        //    // Increment refcount on the new startStop activity
         //    if (newStartStop != null) {
         //        double unknownStartTimeMSec = _unknownTimeStartMsec.Get((int)newStartStop.Index);
-        //        // If we were off before (a positive number) then log the unknown time.  
+        //        // If we were off before (a positive number) then log the unknown time.
         //        if (0 < unknownStartTimeMSec) {
         //            AddUnkownAsyncDurationIfNeeded(newStartStop, unknownStartTimeMSec, data);
         //            unknownStartTimeMSec = 0;
@@ -303,24 +326,24 @@ namespace Microsoft.Diagnostics.Tools.Trace {
         //        return;
         //    }
 
-        //    // We dont bother with times that are too small, we consider 1msec the threshold  
+        //    // We dont bother with times that are too small, we consider 1msec the threshold
         //    double delta = data.TimeStampRelativeMSec - unknownStartTimeMSec;
         //    if (delta < 1) {
         //        return;
         //    }
 
-        //    // Add a sample with the amount of unknown duration.  
-        //    var sample = new StackSourceSample(_outputStackSource);
+        //    // Add a sample with the amount of unknown duration.
+        //    var sample = new StackSourceSample(_stackSource);
         //    sample.Metric = (float)delta;
         //    sample.TimeRelativeMSec = unknownStartTimeMSec;
 
-        //    StackSourceCallStackIndex stackIndex = _startStopActivities.GetStartStopActivityStack(_outputStackSource, startStopActivity, data.Process());
-        //    StackSourceFrameIndex unknownAsyncFrame = _outputStackSource.Interner.FrameIntern("UNKNOWN_ASYNC");
-        //    stackIndex = _outputStackSource.Interner.CallStackIntern(unknownAsyncFrame, stackIndex);
+        //    StackSourceCallStackIndex stackIndex = _startStopActivities.GetStartStopActivityStack(_stackSource, startStopActivity, data.Process());
+        //    StackSourceFrameIndex unknownAsyncFrame = _stackSource.Interner.FrameIntern("UNKNOWN_ASYNC");
+        //    stackIndex = _stackSource.Interner.CallStackIntern(unknownAsyncFrame, stackIndex);
         //    sample.StackIndex = stackIndex;
 
-        //    // We can't add the samples right now because AWAIT nodes might overlap and we have to take these back. 
-        //    // The add the to this list so that they can be trimmed at that time if needed. 
+        //    // We can't add the samples right now because AWAIT nodes might overlap and we have to take these back.
+        //    // The add the to this list so that they can be trimmed at that time if needed.
 
         //    List<StackSourceSample> list = _startStopActivityToAsyncUnknownSamples.Get((int)startStopActivity.Index);
         //    if (list == null) {
@@ -330,75 +353,155 @@ namespace Microsoft.Diagnostics.Tools.Trace {
         //    list.Add(sample);
         //}
 
-        /// <summary>
-        /// This can actually be called with any event that has a stack.   Basically it will log a CPU sample whose
-        /// size is the time between the last such call and the current one.  
-        /// </summary>
-        private void OnSampledProfile(Tracing.TraceEvent data) {
-            TraceThread thread = data.Thread();
-            if (thread != null) {
-                StackSourceCallStackIndex stackIndex = GetCallStack(data, thread);
+        private void AddSample(ThreadIndex threadIndex, StackSourceCallStackIndex callstackIndex, double timestampMs)
+        {
+            if (threadIndex == ThreadIndex.Invalid || callstackIndex == StackSourceCallStackIndex.Invalid)
+            {
+                return;
+            }
 
-                _profile.samples.Add(new() {
-                    Timestamp = (ulong)(data.TimeStampRelativeMSec * 1_000_000),
-                    StackId = (int)stackIndex,
-                    ThreadId = (int)thread.ThreadIndex
-                });
+            var stackIndex = AddStackTrace(callstackIndex);
+            if (stackIndex < 0)
+            {
+                return;
+            }
+
+            _profile.samples.Add(new()
+            {
+                Timestamp = (ulong)(timestampMs * 1_000_000),
+                StackId = stackIndex,
+                ThreadId = (int)threadIndex
+            });
+        }
+
+        /// <summary>
+        /// Add stack trace and frames, if missing
+        /// </summary>
+        /// <param name="callstackIndex"></param>
+        /// <returns>The index into the Profile's stacks list</returns>
+        private int AddStackTrace(StackSourceCallStackIndex callstackIndex)
+        {
+            SentryProfileStackTrace stackTrace = new(5);
+            StackSourceFrameIndex tlFrameIndex;
+            while (callstackIndex != StackSourceCallStackIndex.Invalid)
+            {
+                tlFrameIndex = _stackSource.GetFrameIndex(callstackIndex);
+
+                if (tlFrameIndex == StackSourceFrameIndex.Invalid)
+                {
+                    break;
+                }
+
+                stackTrace.Add(AddStackFrame(tlFrameIndex));
+                callstackIndex = _stackSource.GetCallerIndex(callstackIndex);
+            }
+
+            int result = -1;
+            if (stackTrace.Count > 0)
+            {
+                stackTrace.Seal(5);
+                if (!_stackIndexes.TryGetValue(stackTrace, out result))
+                {
+                    _profile.stacks.Add(stackTrace);
+                    _stackIndexes[stackTrace] = _profile.stacks.Count - 1;
+                }
+            }
+
+            return result;
+        }
+
+        /// <summary>
+        /// Check if the frame is already stored in the output Profile, or add it.
+        /// </summary>
+        /// <param name="frameIndex"></param>
+        /// <returns>The index to the output Profile frames array.</returns>
+        private int AddStackFrame(StackSourceFrameIndex frameIndex)
+        {
+            const int uninitialized = -1;
+
+            var key = (int)frameIndex;
+
+            while (_frameIndexes.Count <= key)
+            {
+                _frameIndexes.Add(uninitialized);
+            }
+
+            if (_frameIndexes[key] == uninitialized)
+            {
+                _profile.frames.Add(new()); // TODO fill in the details
+                _frameIndexes[key] = _profile.frames.Count - 1;
+            }
+
+            return _frameIndexes[key];
+        }
+
+        private void OnSampledProfile(Tracing.TraceEvent data)
+        {
+            TraceThread thread = data.Thread();
+            if (thread != null)
+            {
+                StackSourceCallStackIndex stackFrameIndex = GetCallStack(data, thread);
 
                 //bool onCPU = (data is ClrThreadSampleTraceData) ? ((ClrThreadSampleTraceData)data).Type == ClrThreadSampleType.Managed : true;
-
                 //_threadState[(int)thread.ThreadIndex].LogThreadStack(data.TimeStampRelativeMSec, stackIndex, thread, this, onCPU);
+                AddSample(thread.ThreadIndex, stackFrameIndex, data.TimeStampRelativeMSec);
             }
-            else {
+            else
+            {
                 Debug.WriteLine("Warning, no thread at " + data.TimeStampRelativeMSec.ToString("f3"));
             }
         }
 
-        //// THis is for the TaskWaitEnd.  We want to have a stack event if 'data' does not have one, we lose the fact that
-        //// ANYTHING happened on this thread.   Thus we log the stack of the activity so that data does not need a stack.  
-        //private void OnTaskUnblock(Tracing.TraceEvent data) {
-        //    if (_activityComputer == null) {
-        //        return;
-        //    }
+        // THis is for the TaskWaitEnd.  We want to have a stack event if 'data' does not have one, we lose the fact that
+        // ANYTHING happened on this thread.   Thus we log the stack of the activity so that data does not need a stack.
+        private void OnTaskUnblock(Tracing.TraceEvent data)
+        {
+            if (_activityComputer == null)
+            {
+                return;
+            }
 
-        //    TraceThread thread = data.Thread();
-        //    if (thread != null) {
-        //        TraceActivity activity = _activityComputer.GetCurrentActivity(thread);
+            TraceThread thread = data.Thread();
+            if (thread != null)
+            {
+                TraceActivity activity = _activityComputer.GetCurrentActivity(thread);
 
-        //        //StackSourceCallStackIndex stackIndex = _activityComputer.GetCallStackForActivity(_outputStackSource, activity, GetTopFramesForActivityComputerCase(data, data.Thread()));
-        //        StackSourceCallStackIndex stackIndex = _activityComputer.GetCallStackForActivity(_outputStackSource, activity);
-        //        _threadState[(int)thread.ThreadIndex].LogThreadStack(data.TimeStampRelativeMSec, stackIndex, thread, this, onCPU: true);
-        //    }
-        //    else {
-        //        Debug.WriteLine("Warning, no thread at " + data.TimeStampRelativeMSec.ToString("f3"));
-        //    }
-        //}
+                //StackSourceCallStackIndex stackIndex = _activityComputer.GetCallStackForActivity(_stackSource, activity, GetTopFramesForActivityComputerCase(data, data.Thread()));
+                StackSourceCallStackIndex stackFrameIndex = _activityComputer.GetCallStackForActivity(_stackSource, activity);
+                //_threadState[(int)thread.ThreadIndex].LogThreadStack(data.TimeStampRelativeMSec, stackIndex, thread, this, onCPU: true);
+                AddSample(thread.ThreadIndex, stackFrameIndex, data.TimeStampRelativeMSec);
+            }
+            else
+            {
+                Debug.WriteLine("Warning, no thread at " + data.TimeStampRelativeMSec.ToString("f3"));
+            }
+        }
 
         /// <summary>
-        /// Get the call stack for 'data'  Note that you thread must be data.Thread().   We pass it just to save the lookup.  
+        /// Get the call stack for 'data'  Note that you thread must be data.Thread().   We pass it just to save the lookup.
         /// </summary>
-        private StackSourceCallStackIndex GetCallStack(Tracing.TraceEvent data, TraceThread thread) {
+        private StackSourceCallStackIndex GetCallStack(Tracing.TraceEvent data, TraceThread thread)
+        {
             Debug.Assert(data.Thread() == thread);
 
-            //return _activityComputer.GetCallStack(_outputStackSource, data, GetTopFramesForActivityComputerCase(data, thread));
-            //return _activityComputer.GetCallStack(_outputStackSource, data);
-            return StackSourceCallStackIndex.Invalid; // TODO
+            //return _activityComputer.GetCallStack(_stackSource, data, GetTopFramesForActivityComputerCase(data, thread));
+            return _activityComputer.GetCallStack(_stackSource, data);
         }
 
         ///// <summary>
         ///// Returns a function that figures out the top (closest to stack root) frames for an event.  Often
-        ///// this returns null which means 'use the normal thread-process frames'. 
+        ///// this returns null which means 'use the normal thread-process frames'.
         ///// Normally this stack is for the current time, but if 'getAtCreationTime' is true, it will compute the
-        ///// stack at the time that the current activity was CREATED rather than the current time.  This works 
-        ///// better for await time.  
+        ///// stack at the time that the current activity was CREATED rather than the current time.  This works
+        ///// better for await time.
         ///// </summary>
         //private Func<TraceThread, StackSourceCallStackIndex> GetTopFramesForActivityComputerCase(Tracing.TraceEvent data, TraceThread thread, bool getAtCreationTime = false) {
         //    Debug.Assert(_activityComputer != null);
-        //    return (topThread => _startStopActivities.GetCurrentStartStopActivityStack(_outputStackSource, thread, topThread, getAtCreationTime));
+        //    return (topThread => _startStopActivities.GetCurrentStartStopActivityStack(_stackSource, thread, topThread, getAtCreationTime));
         //}
 
         ///// <summary>
-        ///// Represents all the information that we need to track for each thread.  
+        ///// Represents all the information that we need to track for each thread.
         ///// </summary>
         //private struct ThreadState {
         //    public void LogThreadStack(double timeRelativeMSec, StackSourceCallStackIndex stackIndex, TraceThread thread, SentrySampleProfiler computer, bool onCPU) {
@@ -408,7 +511,7 @@ namespace Microsoft.Diagnostics.Tools.Trace {
         //                AddCPUSample(timeRelativeMSec, thread, computer);
         //                LastBlockStackRelativeMSec = -1; // make ThreadRunning true
         //            }
-        //            else if (ThreadRunning) // continue running 
+        //            else if (ThreadRunning) // continue running
         //            {
         //                AddCPUSample(timeRelativeMSec, thread, computer);
         //            }
@@ -446,8 +549,8 @@ namespace Microsoft.Diagnostics.Tools.Trace {
         //            var nodeIndex = computer._cpuFrameIndex;
         //            sample.StackIndex = LastCPUCallStack;
 
-        //            sample.StackIndex = computer._outputStackSource.Interner.CallStackIntern(nodeIndex, sample.StackIndex);
-        //            computer._outputStackSource.AddSample(sample); // CPU
+        //            sample.StackIndex = computer._stackSource.Interner.CallStackIntern(nodeIndex, sample.StackIndex);
+        //            computer._stackSource.AddSample(sample); // CPU
         //        }
         //    }
 
@@ -461,8 +564,8 @@ namespace Microsoft.Diagnostics.Tools.Trace {
         //            var nodeIndex = computer._ExternalFrameIndex;       // BLOCKED_TIME
         //            sample.StackIndex = LastBlockCallStack;
 
-        //            sample.StackIndex = computer._outputStackSource.Interner.CallStackIntern(nodeIndex, sample.StackIndex);
-        //            computer._outputStackSource.AddSample(sample);
+        //            sample.StackIndex = computer._stackSource.Interner.CallStackIntern(nodeIndex, sample.StackIndex);
+        //            computer._stackSource.AddSample(sample);
         //        }
         //    }
 
@@ -472,7 +575,7 @@ namespace Microsoft.Diagnostics.Tools.Trace {
         //    public bool ThreadUninitialized { get { return LastBlockStackRelativeMSec == 0; } }
 
         //    /* State */
-        //    internal double LastBlockStackRelativeMSec;        // Negative means not blocked, NegativeInfinity means dead.  0 means uninitialized.  
+        //    internal double LastBlockStackRelativeMSec;        // Negative means not blocked, NegativeInfinity means dead.  0 means uninitialized.
         //    internal StackSourceCallStackIndex LastBlockCallStack;
 
         //    internal double LastCPUStackRelativeMSec;
@@ -480,11 +583,106 @@ namespace Microsoft.Diagnostics.Tools.Trace {
         //}
     }
 
-    internal class SentrySampleProfile {
-        public GrowableArray<Sample> samples;
+    /// <summary>
+    /// A GrowableArray that can be used as a key in a Dictionary.
+    /// Note: it must be Seal()-ed before used as a key and can't be changed afterwards.
+    /// </summary>
+    internal sealed class HashableGrowableArray<T> : IEquatable<HashableGrowableArray<T>>
+    {
+        private GrowableArray<T> _items;
+        private int _hashCode = 0;
+        private bool _sealed = false;
 
+        public HashableGrowableArray()
+        {
+            _items = new GrowableArray<T>();
+        }
 
-        public class Sample {
+        public HashableGrowableArray(int capacity)
+        {
+            _items = new GrowableArray<T>(capacity);
+        }
+
+        public T this[int index]
+        {
+            get
+            {
+                return _items[index];
+            }
+            set
+            {
+                Debug.Assert(!_sealed);
+                _items[index] = value;
+            }
+        }
+
+        public int Count => _items.Count;
+
+        /// <summary>
+        /// Seal this array so that it cannot be changed anymore and can be hashed.
+        /// </summary>
+        /// <param name="maxWaste">
+        /// If more or equal to zero, trims the size of the array so that no more than the given number of slots are wasted.
+        /// </param>
+        public void Seal(int maxWaste = -1)
+        {
+            Debug.Assert(!_sealed);
+            _sealed = true;
+            if (maxWaste >= 0)
+            {
+                _items.Trim(maxWaste);
+            }
+            foreach (var item in _items)
+            {
+                _hashCode ^= item.GetHashCode();
+            }
+        }
+
+        public void Add(T item)
+        {
+            Debug.Assert(!_sealed);
+            _items.Add(item);
+        }
+
+        public override int GetHashCode()
+        {
+            Debug.Assert(_sealed);
+            return _hashCode;
+        }
+
+        public bool Equals(HashableGrowableArray<T> rhs)
+        {
+            Debug.Assert(_sealed);
+            if (ReferenceEquals(this, rhs))
+                return true;
+            if (ReferenceEquals(rhs, null))
+                return false;
+            if (rhs._hashCode != _hashCode)
+                return false;
+            var ic = _items.Count;
+            if (ic != rhs._items.Count)
+                return false;
+            for (var i = 0; i < ic; ++i)
+                if (!Equals(_items[i], rhs._items[i]))
+                    return false;
+            return true;
+        }
+
+        public override bool Equals(object obj)
+        {
+            Debug.Assert(_sealed);
+            return Equals(obj as HashableGrowableArray<T>);
+        }
+    }
+
+    internal class SentrySampleProfile
+    {
+        public GrowableArray<Sample> samples = new(10000);
+        public GrowableArray<SentryStackFrame> frames = new(100);
+        public GrowableArray<SentryProfileStackTrace> stacks = new(100);
+
+        public class Sample
+        {
             /// <summary>
             /// Timestamp in nanoseconds relative to the profile start.
             /// </summary>
