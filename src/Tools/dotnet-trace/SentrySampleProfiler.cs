@@ -2,19 +2,15 @@
 using Microsoft.Diagnostics.Tracing.Etlx;
 using Microsoft.Diagnostics.Tracing.EventPipe;
 using Microsoft.Diagnostics.Tracing.Parsers;
-using Microsoft.Diagnostics.Tracing.Session;
 using Microsoft.Diagnostics.Tracing.Stacks;
 using Sentry;
+using Sentry.Extensibility;
 using System;
-using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.Diagnostics.Tracing;
+using System.Globalization;
 using System.IO;
-using System.Linq;
-using System.Runtime.InteropServices;
-using System.Text;
-using System.Threading.Tasks;
+using System.Text.Json;
 
 namespace Microsoft.Diagnostics.Tools.Trace
 {
@@ -45,7 +41,7 @@ namespace Microsoft.Diagnostics.Tools.Trace
         private bool IgnoreApplicationInsightsRequestsWithRelatedActivityId { get; set; } = true;
 
 
-        private readonly TraceLog _eventLog;                        // The event log associated with _source.
+        private readonly TraceLog _traceLog; 
         TraceLogEventSource _eventSource;
 
         /// <summary>
@@ -53,10 +49,10 @@ namespace Microsoft.Diagnostics.Tools.Trace
         /// </summary>
         private readonly SentrySampleProfile _profile = new();
 
-        // A sparse array that maps from StackSourceFrameIndex to the frame index in the output Profile.
-        private GrowableArray<int> _frameIndexes = new(10000);
+        // A sparse array that maps from StackSourceFrameIndex to an index in the output Profile.frames.
+        private SparseScalarArray<int> _frameIndexes = new(-1, 1000);
 
-        // A dictionary a StackTrace sealed array into the output Profile.
+        // A dictionary from a StackTrace sealed array to an index in the output Profile.stacks.
         private Dictionary<SentryProfileStackTrace, int> _stackIndexes = new(100);
 
         //private Tracing.StartStopActivityComputer _startStopActivities;    // Tracks start-stop activities so we can add them to the top above thread in the stack.
@@ -101,10 +97,9 @@ namespace Microsoft.Diagnostics.Tools.Trace
 
         public SentrySampleProfiler(TraceLog traceLog)
         {
-            _eventLog = traceLog;
-            _eventSource = _eventLog.Events.GetSource();
-
-            _stackSource = new MutableTraceEventStackSource(_eventLog)
+            _traceLog = traceLog;
+            _eventSource = _traceLog.Events.GetSource();
+            _stackSource = new MutableTraceEventStackSource(_traceLog)
             {
                 //_stackSource = new TraceEventStackSource(_eventLog.Events) {
                 OnlyManagedCodeStacks = true // EventPipe currently only has managed code stacks.
@@ -221,13 +216,12 @@ namespace Microsoft.Diagnostics.Tools.Trace
 
             var sampleEventParser = new SampleProfilerTraceEventParser(_eventSource);
             sampleEventParser.ThreadSample += OnSampledProfile;
-
-            _eventSource.Process();
         }
 
-        public void Process()
-        {
-            //_eventSource.Process();
+        public SentrySampleProfile Process() {
+
+            _eventSource.Process();
+            return _profile;
         }
 
         //private void UpdateStartStopActivityOnAwaitComplete(TraceActivity activity, Tracing.TraceEvent data) {
@@ -353,9 +347,9 @@ namespace Microsoft.Diagnostics.Tools.Trace
         //    list.Add(sample);
         //}
 
-        private void AddSample(ThreadIndex threadIndex, StackSourceCallStackIndex callstackIndex, double timestampMs)
+        private void AddSample(TraceThread thread, StackSourceCallStackIndex callstackIndex, double timestampMs)
         {
-            if (threadIndex == ThreadIndex.Invalid || callstackIndex == StackSourceCallStackIndex.Invalid)
+            if (thread.ThreadIndex == ThreadIndex.Invalid || callstackIndex == StackSourceCallStackIndex.Invalid)
             {
                 return;
             }
@@ -366,16 +360,21 @@ namespace Microsoft.Diagnostics.Tools.Trace
                 return;
             }
 
+            var threadIndex = AddThread(thread);
+            if (threadIndex < 0) {
+                return;
+            }
+
             _profile.samples.Add(new()
             {
                 Timestamp = (ulong)(timestampMs * 1_000_000),
                 StackId = stackIndex,
-                ThreadId = (int)threadIndex
+                ThreadId = threadIndex
             });
         }
 
         /// <summary>
-        /// Add stack trace and frames, if missing
+        /// Adds stack trace and frames, if missing.
         /// </summary>
         /// <param name="callstackIndex"></param>
         /// <returns>The index into the Profile's stacks list</returns>
@@ -411,28 +410,71 @@ namespace Microsoft.Diagnostics.Tools.Trace
         }
 
         /// <summary>
-        /// Check if the frame is already stored in the output Profile, or add it.
+        /// Check if the frame is already stored in the output Profile, or adds it.
         /// </summary>
         /// <param name="frameIndex"></param>
         /// <returns>The index to the output Profile frames array.</returns>
         private int AddStackFrame(StackSourceFrameIndex frameIndex)
         {
-            const int uninitialized = -1;
-
             var key = (int)frameIndex;
 
-            while (_frameIndexes.Count <= key)
+            if (!_frameIndexes.ContainsKey(key))
             {
-                _frameIndexes.Add(uninitialized);
-            }
-
-            if (_frameIndexes[key] == uninitialized)
-            {
-                _profile.frames.Add(new()); // TODO fill in the details
+                _profile.frames.Add(CreateStackFrame(frameIndex));
                 _frameIndexes[key] = _profile.frames.Count - 1;
             }
 
             return _frameIndexes[key];
+        }
+
+        /// <summary>
+        /// Check if the thread is already stored in the output Profile, or adds it.
+        /// </summary>
+        /// <param name="frameIndex"></param>
+        /// <returns>The index to the output Profile frames array.</returns>
+        private int AddThread(TraceThread thread) {
+            var key = (int)thread.ThreadIndex;
+
+            if (!_profile.threads.ContainsKey(key)) {
+                _profile.threads[key] = new() {
+                    Id = key,
+                    // TODO it should be possible to get the actual name of the thread somehow - speedscope output has it among frames, e.g. "Thread (30396) (.NET ThreadPool)"
+                    Name = thread.ThreadInfo
+                };
+            }
+
+            return key;
+        }
+
+        // TODO align this with Sentry's StackTraceFactory
+        private SentryStackFrame CreateStackFrame(StackSourceFrameIndex frameIndex) {
+            var frame = new SentryStackFrame();
+
+            CodeAddressIndex codeAddressIndex = _stackSource.GetFrameCodeAddress(frameIndex);
+            if (codeAddressIndex != CodeAddressIndex.Invalid) {
+                TraceMethod method = _traceLog.CodeAddresses.Methods[_traceLog.CodeAddresses.MethodIndex(codeAddressIndex)];
+                if (method is not null) {
+                    frame.Function = method.FullMethodName;
+
+                    TraceModuleFile moduleFile = method.MethodModuleFile;
+                    if (moduleFile is not null) {
+                        frame.Module = moduleFile.Name;
+                    }
+                }
+
+                var ilOffset = _traceLog.CodeAddresses.ILOffset(codeAddressIndex);
+                if (ilOffset >= 0) {
+                    frame.InstructionAddress = $"0x{ilOffset:x}";
+                }
+
+                // TODO check if this is useful
+                // Displays the optimization tier of each code version executed for the method.
+                //if (ShowOptimizationTiers) {
+                //    text = TraceMethod.PrefixOptimizationTier(text, _traceLog.CodeAddresses.OptimizationTier(codeAddress));
+                //}
+            }
+
+            return frame;
         }
 
         private void OnSampledProfile(Tracing.TraceEvent data)
@@ -444,7 +486,7 @@ namespace Microsoft.Diagnostics.Tools.Trace
 
                 //bool onCPU = (data is ClrThreadSampleTraceData) ? ((ClrThreadSampleTraceData)data).Type == ClrThreadSampleType.Managed : true;
                 //_threadState[(int)thread.ThreadIndex].LogThreadStack(data.TimeStampRelativeMSec, stackIndex, thread, this, onCPU);
-                AddSample(thread.ThreadIndex, stackFrameIndex, data.TimeStampRelativeMSec);
+                AddSample(thread, stackFrameIndex, data.TimeStampRelativeMSec);
             }
             else
             {
@@ -469,7 +511,7 @@ namespace Microsoft.Diagnostics.Tools.Trace
                 //StackSourceCallStackIndex stackIndex = _activityComputer.GetCallStackForActivity(_stackSource, activity, GetTopFramesForActivityComputerCase(data, data.Thread()));
                 StackSourceCallStackIndex stackFrameIndex = _activityComputer.GetCallStackForActivity(_stackSource, activity);
                 //_threadState[(int)thread.ThreadIndex].LogThreadStack(data.TimeStampRelativeMSec, stackIndex, thread, this, onCPU: true);
-                AddSample(thread.ThreadIndex, stackFrameIndex, data.TimeStampRelativeMSec);
+                AddSample(thread, stackFrameIndex, data.TimeStampRelativeMSec);
             }
             else
             {
@@ -582,7 +624,7 @@ namespace Microsoft.Diagnostics.Tools.Trace
         //    private StackSourceCallStackIndex LastCPUCallStack;
         //}
     }
-
+    
     /// <summary>
     /// A GrowableArray that can be used as a key in a Dictionary.
     /// Note: it must be Seal()-ed before used as a key and can't be changed afterwards.
@@ -617,6 +659,11 @@ namespace Microsoft.Diagnostics.Tools.Trace
         }
 
         public int Count => _items.Count;
+
+        //
+        // Summary:
+        //     Returns the underlying array. Should not be used most of the time!
+        public GrowableArray<T> UnderlyingArray => _items;
 
         /// <summary>
         /// Seal this array so that it cannot be changed anymore and can be hashed.
@@ -675,14 +722,118 @@ namespace Microsoft.Diagnostics.Tools.Trace
         }
     }
 
-    internal class SentrySampleProfile
-    {
+    /// <summary>
+    /// Sparse array for scalars (value types). You must provide the uninitialized value that will be used for new unused elements.
+    /// </summary>
+    /// <typeparam name="T"></typeparam>
+    internal sealed class SparseScalarArray<T> where T : IEquatable<T> {
+        private GrowableArray<T> _items;
+        private T _uninitializedValue;
+
+        public SparseScalarArray(T uninitializedValue) {
+            _items = new GrowableArray<T>();
+            _uninitializedValue = uninitializedValue;
+        }
+
+        public SparseScalarArray(T uninitializedValue, int capacity) {
+            _items = new GrowableArray<T>(capacity);
+            _uninitializedValue = uninitializedValue;
+        }
+
+        public T this[int index] {
+            get {
+                return _items[index];
+            }
+            set {
+                // Increase the capacity of the sparse array so that the key can fit.
+                while (_items.Count <= index) {
+                    _items.Add(_uninitializedValue);
+                }
+                _items[index] = value;
+            }
+        }
+
+        public bool ContainsKey(int key) {
+            return key > 0 && key < _items.Count && !_uninitializedValue.Equals(_items[key]);
+        }
+    }
+
+    /// <summary>
+    /// Sparse array for objects. Null value is considered a missing item.
+    /// </summary>
+    /// <typeparam name="T"></typeparam>
+    internal sealed class SparseObjectArray<T> where T : class {
+        private GrowableArray<T> _items;
+
+        public SparseObjectArray() {
+            _items = new GrowableArray<T>();
+        }
+
+        public SparseObjectArray(int capacity) {
+            _items = new GrowableArray<T>(capacity);
+        }
+
+        public T this[int index] {
+            get {
+                return _items[index];
+            }
+            set {
+                // Increase the capacity of the sparse array so that the key can fit.
+                while (_items.Count <= index) {
+                    _items.Add(null);
+                }
+                _items[index] = value;
+            }
+        }
+
+        public bool ContainsKey(int key) {
+            return key > 0 && key < _items.Count && _items[key] is not null;
+        }
+
+        /// <summary>
+        /// Executes 'func(key, value)' for each element present.
+        /// </summary>
+        public void Foreach(Action<int, T> func) {
+            for (int i = 0; i < _items.Count; i++) {
+                if (_items[i] is not null) {
+                    func(i, _items[i]);
+                }
+            }
+        }
+
+    }
+
+    internal class SentrySampleProfile : IJsonSerializable {
         public GrowableArray<Sample> samples = new(10000);
         public GrowableArray<SentryStackFrame> frames = new(100);
         public GrowableArray<SentryProfileStackTrace> stacks = new(100);
+        public SparseObjectArray<SentryThread> threads = new(10); 
 
-        public class Sample
-        {
+        public void WriteTo(Utf8JsonWriter writer, IDiagnosticLogger logger) {
+            writer.WriteStartObject();
+
+            writer.WritePropertyName("thread_metadata");
+            writer.WriteStartObject();
+            threads.Foreach((k, v) => {
+                writer.WritePropertyName(k.ToString());
+                writer.WriteDynamicValue(v, logger);
+            });
+            writer.WriteEndObject();
+
+            writer.WritePropertyName("stacks");
+            writer.WriteStartArray();
+            foreach (var stack in stacks) {
+                writer.WriteGrowableArrayValue<int>(stack.UnderlyingArray, logger);
+            }
+            writer.WriteEndArray();
+            writer.WriteGrowableArray<SentryStackFrame>("frames", frames, logger);
+
+            writer.WriteGrowableArray<Sample>("samples", samples, logger);
+
+            writer.WriteEndObject();
+        }
+
+        public class Sample : IJsonSerializable {
             /// <summary>
             /// Timestamp in nanoseconds relative to the profile start.
             /// </summary>
@@ -690,6 +841,137 @@ namespace Microsoft.Diagnostics.Tools.Trace
 
             public int ThreadId;
             public int StackId;
+
+            public void WriteTo(Utf8JsonWriter writer, IDiagnosticLogger logger) {
+                writer.WriteStartObject();
+
+                writer.WriteNumber("elapsed_since_start_ns", Timestamp);
+                writer.WriteNumber("thread_id", ThreadId);
+                writer.WriteNumber("stack_id", StackId);
+
+                writer.WriteEndObject();
+            }
         }
+    }
+    internal static class JsonExtensions {
+
+        public static void WriteGrowableArray<T>(
+            this Utf8JsonWriter writer,
+            string propertyName,
+            GrowableArray<T>? arr,
+            IDiagnosticLogger logger) {
+            writer.WritePropertyName(propertyName);
+            writer.WriteGrowableArrayValue(arr, logger);
+        }
+
+        public static void WriteGrowableArrayValue<T>(
+            this Utf8JsonWriter writer,
+            GrowableArray<T>? arr,
+            IDiagnosticLogger logger) {
+            if (arr is not null) {
+                writer.WriteStartArray();
+
+                foreach (var i in arr) {
+                    writer.WriteDynamicValue(i, logger);
+                }
+
+                writer.WriteEndArray();
+            }
+            else {
+                writer.WriteNullValue();
+            }
+        }
+
+        // TODO remove - the rest is just a copy from src\Sentry\Internal\Extensions\JsonExtensions.cs
+
+
+        public static void WriteSerializableValue(
+            this Utf8JsonWriter writer,
+            IJsonSerializable value,
+            IDiagnosticLogger logger) {
+            value.WriteTo(writer, logger);
+        }
+
+        public static void WriteSerializable(
+            this Utf8JsonWriter writer,
+            string propertyName,
+            IJsonSerializable value,
+            IDiagnosticLogger logger) {
+            writer.WritePropertyName(propertyName);
+            writer.WriteSerializableValue(value, logger);
+        }
+
+        public static void WriteArray(
+            this Utf8JsonWriter writer,
+            string propertyName,
+            IEnumerable<object> arr,
+            IDiagnosticLogger logger) {
+            writer.WritePropertyName(propertyName);
+            writer.WriteArrayValue(arr, logger);
+        }
+
+        public static void WriteArrayValue(
+            this Utf8JsonWriter writer,
+            IEnumerable<object> arr,
+            IDiagnosticLogger logger) {
+            if (arr is not null) {
+                writer.WriteStartArray();
+
+                foreach (var i in arr) {
+                    writer.WriteDynamicValue(i, logger);
+                }
+
+                writer.WriteEndArray();
+            }
+            else {
+                writer.WriteNullValue();
+            }
+        }
+
+        public static void WriteDynamicValue(
+            this Utf8JsonWriter writer,
+            object value,
+            IDiagnosticLogger logger) {
+            if (value is null) {
+                writer.WriteNullValue();
+            }
+            else if (value is IJsonSerializable serializable) {
+                writer.WriteSerializableValue(serializable, logger);
+            }
+            //else if (value is IEnumerable<KeyValuePair<string, string?>> sdic) {
+            //    writer.WriteStringDictionaryValue(sdic);
+            //}
+            //else if (value is IEnumerable<KeyValuePair<string, object?>> dic) {
+            //    writer.WriteDictionaryValue(dic, logger);
+            //}
+            else if (value is string str) {
+                writer.WriteStringValue(str);
+            }
+            else if (value is bool b) {
+                writer.WriteBooleanValue(b);
+            }
+            else if (value is int i) {
+                writer.WriteNumberValue(i);
+            }
+            else if (value is long l) {
+                writer.WriteNumberValue(l);
+            }
+            else if (value is double d) {
+                writer.WriteNumberValue(d);
+            }
+            else if (value is DateTime dt) {
+                writer.WriteStringValue(dt);
+            }
+            else if (value is DateTimeOffset dto) {
+                writer.WriteStringValue(dto);
+            }
+            else if (value is IFormattable formattable) {
+                writer.WriteStringValue(formattable.ToString(null, CultureInfo.InvariantCulture));
+            }
+            else {
+                JsonSerializer.Serialize(writer, value);
+            }
+        }
+
     }
 }

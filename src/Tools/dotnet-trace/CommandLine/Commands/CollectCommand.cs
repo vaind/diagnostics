@@ -21,7 +21,8 @@ using Microsoft.Diagnostics.Tracing.EventPipe;
 using Microsoft.Diagnostics.Tracing.Etlx;
 using Microsoft.Diagnostics.Symbols;
 using Microsoft.Diagnostics.Tracing.Stacks;
-using static Microsoft.Diagnostics.Tools.Trace.StackSourceWriterHelper;
+using Dia2Lib;
+using System.Text.Json;
 
 namespace Microsoft.Diagnostics.Tools.Trace
 {
@@ -436,48 +437,17 @@ namespace Microsoft.Diagnostics.Tools.Trace
 
             using (var eventLog = new TraceLog(etlxFilePath)) {
                 var processor = new SentrySampleProfiler(eventLog);
-                processor.Process();
+                var profile = processor.Process();
 
-                //var stackSource = new MutableTraceEventStackSource(eventLog) {
-                //    OnlyManagedCodeStacks = true // EventPipe currently only has managed code stacks.
-                //};
+                if (File.Exists(outputFilename)) {
+                    File.Delete(outputFilename);
+                }
 
-                //var computer = new SampleProfilerThreadTimeComputer(eventLog, new SymbolReader(TextWriter.Null)) {
-                //    IncludeEventSourceEvents = false // SpeedScope handles only CPU samples, events are not supported
-                //    // TODO, at the very least, can we filter these out before writing to the original nettrace file?
-                //};
-                //computer.GenerateThreadTimeStacks(stackSource);
-
-                //var profile = new SentrySampleProfile();
-
-                //stackSource.ForEach(sample => {
-                //    var stackIndex = sample.StackIndex;
-
-                //    while (stackIndex != StackSourceCallStackIndex.Invalid) {
-                //        var frameName = stackSource.GetFrameName(stackSource.GetFrameIndex(stackIndex), false);
-
-                //        // we walk the stack up until we find the Thread name
-                //        if (!frameName.StartsWith("Thread (")) {
-                //            stackIndex = stackSource.GetCallerIndex(stackIndex);
-                //            continue;
-                //        }
-
-                //        // we assume that the next caller is always process
-                //        var processStackIndex = stackSource.GetCallerIndex(stackIndex);
-                //        var processFrameName = processStackIndex == StackSourceCallStackIndex.Invalid
-                //            ? "Unknown"
-                //            : stackSource.GetFrameName(stackSource.GetFrameIndex(processStackIndex), false);
-
-                //        var threadInfo = new ThreadInfo(frameName, processFrameName);
-
-                //        //if (!samplesPerThread.TryGetValue(threadInfo, out var samples))
-                //        //    samplesPerThread[threadInfo] = samples = new List<Sample>();
-
-                //        //samples.Add(new Sample(sample.StackIndex, sample.TimeRelativeMSec, sample.Metric, -1, -1));
-
-                //        return;
-                //    }
-                //});
+                using (FileStream f = new FileStream(outputFilename, FileMode.OpenOrCreate, FileAccess.ReadWrite)) {
+                    using var writer = new Utf8JsonWriter(f);
+                    profile.WriteTo(writer, null);
+                    writer.Flush();
+                }
             }
 
             if (File.Exists(etlxFilePath)) {
