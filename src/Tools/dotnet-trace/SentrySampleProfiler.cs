@@ -465,7 +465,7 @@ namespace Microsoft.Diagnostics.Tools.Trace
                 var ilOffset = _traceLog.CodeAddresses.ILOffset(codeAddressIndex);
                 if (ilOffset >= 0) {
                     frame.InstructionAddress = $"0x{ilOffset:x}";
-                }
+                } 
 
                 // TODO check if this is useful
                 // Displays the optimization tier of each code version executed for the method.

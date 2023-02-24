@@ -23,6 +23,7 @@ using Microsoft.Diagnostics.Symbols;
 using Microsoft.Diagnostics.Tracing.Stacks;
 using Dia2Lib;
 using System.Text.Json;
+using Sentry;
 
 namespace Microsoft.Diagnostics.Tools.Trace
 {
@@ -238,9 +239,22 @@ namespace Microsoft.Diagnostics.Tools.Trace
                     var rundownRequested = false;
                     System.Timers.Timer durationTimer = null;
 
-
+                    using (SentrySdk.Init(o =>
+                    {
+                        // Tells which project in Sentry to send events to:
+                        o.Dsn = "https://eb18e953812b41c3aeb042e666fd3b5c@o447951.ingest.sentry.io/5428537";
+                        // When configuring for the first time, to see what the SDK is doing:
+                        o.Debug = true;
+                        // Set traces_sample_rate to 1.0 to capture 100% of transactions for performance monitoring.
+                        // We recommend adjusting this value in production.
+                        o.TracesSampleRate = 1.0;
+                        // Enable Global Mode if running in a client app
+                        o.IsGlobalModeEnabled = true;
+                    }))
                     using (VirtualTerminalMode vTermMode = printStatusOverTime ? VirtualTerminalMode.TryEnable() : null)
                     {
+                        var tx = SentrySdk.StartTransaction("dotnet-trace", "profiling");
+                        
                         EventPipeSession session = null;
                         try
                         {
@@ -373,7 +387,11 @@ namespace Microsoft.Diagnostics.Tools.Trace
 
                         ConsoleWriteLine($"\nTrace completed.");
 
-                        ConvertToSentry(output.FullName);
+                        ConsoleWriteLine($"\nSentry TX trace ID: ${tx.TraceId}");
+                        ConsoleWriteLine($"\nSentry TX: ${tx}");
+                        tx.Finish();
+
+                        ConvertToSentry(output.FullName, tx);
                     }
 
                     if (!collectionStopped && !ct.IsCancellationRequested)
@@ -422,11 +440,8 @@ namespace Microsoft.Diagnostics.Tools.Trace
             return await Task.FromResult(ret);
         }
 
-        private static void ConvertToSentry(string fileToConvert, string outputFilename = "") {
-            if (string.IsNullOrWhiteSpace(outputFilename))
-                outputFilename = fileToConvert;
-
-            outputFilename = Path.ChangeExtension(outputFilename, ".json");
+        private static void ConvertToSentry(string fileToConvert, ITransaction sentryTx) {
+            var outputFilename = Path.ChangeExtension(fileToConvert, ".json");
             Console.Out.WriteLine($"Writing:\t{outputFilename}");
 
             // We convert the EventPipe log (ETL) to ETLX to get processed stack traces. 
@@ -444,8 +459,44 @@ namespace Microsoft.Diagnostics.Tools.Trace
                 }
 
                 using (FileStream f = new FileStream(outputFilename, FileMode.OpenOrCreate, FileAccess.ReadWrite)) {
-                    using var writer = new Utf8JsonWriter(f);
+                    var options = new JsonWriterOptions() { SkipValidation = true, Indented = false };
+                    using var writer = new Utf8JsonWriter(f, options);
+                    writer.WriteStartObject();
+                    writer.WriteRawValue("""
+                          "debug_meta": {
+                            "images": []
+                          },
+                          "device": {
+                            "architecture": "x86_64"
+                          },
+                          "environment": "development"
+                    """, skipInputValidation: true);
+                    writer.WriteRawValue($"\"event_id\": \"{SentryId.Create()}\"", skipInputValidation: true);
+                    writer.WriteRawValue("""
+                          "measurements": {},
+                          "os": {
+                            "build": "19045",
+                            "name": "Windows",
+                            "build_number": "10.0.19045"
+                          },
+                          "platform": "dotnet"
+                    """, skipInputValidation: true);
+                    writer.WriteRawValue($"\"timestamp\": \"${sentryTx.StartTimestamp}\"", skipInputValidation: true);
+                    writer.WriteRawValue("""
+                          "transaction": {
+                            "active_thread_id": "259"
+                    """, skipInputValidation: true);
+
+                    writer.WriteRawValue($"\"id\": \"${sentryTx.SpanId}\"", skipInputValidation: true);
+                    writer.WriteRawValue($"\"trace_id\": \"{sentryTx.TraceId}\"", skipInputValidation: true);
+                    writer.WriteRawValue("""
+                            "name": "dotnet-trace"
+                          },
+                          "version": "1"
+                    """, skipInputValidation: true);
+                    writer.WritePropertyName("profile");
                     profile.WriteTo(writer, null);
+                    writer.WriteEndObject();
                     writer.Flush();
                 }
             }
